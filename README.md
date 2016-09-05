@@ -12,7 +12,7 @@ to remain stealthy and persist for an extended period of time.
 
 **Corresponding article:**
 
-G. Pék, Zs. Lázár, Z. Várnagy, M. Félegyházi, L. Buttyán, [Membrane: A Posteriori Detection of Malicious Code Loading by Memory Paging Analysis (Accepted paper),](http://www.crysys.hu/~pek/pubs/Pek+16ESORICS.pdf), ESORICS, Heraklion, Greece, 2016. 
+G. Pék, Zs. Lázár, Z. Várnagy, M. Félegyházi, L. Buttyán, [Membrane: A Posteriori Detection of Malicious Code Loading by Memory Paging Analysis (Accepted paper)](http://www.crysys.hu/~pek/pubs/Pek+16ESORICS.pdf), ESORICS, 2016. 
 
 
 ## Source
