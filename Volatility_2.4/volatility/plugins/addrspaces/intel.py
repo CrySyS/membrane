@@ -24,7 +24,10 @@
 #
 
 import struct
+import sys
+from volatility import debug
 import volatility.plugins.addrspaces.paged as paged
+import volatility.plugins.addrspaces.page_profiler as pprofiler
 import volatility.obj as obj
 
 entry_size = 8
@@ -82,7 +85,30 @@ class IA32PagedMemory(paged.AbstractWritablePagedMemory):
         paged.AbstractWritablePagedMemory.__init__(self, base, config, dtb = dtb, skip_as_check = skip_as_check, *args, **kwargs)
 
     def is_valid_profile(self, profile):
+        if profile.metadata.get('os', 'Unknown').lower() == 'windows':
+            self.use_prototype_ptes = True
+
         return profile.metadata.get('memory_model', '32bit') == '32bit' or profile.metadata.get('os', 'Unknown').lower() == 'mac'
+
+    def entry_pagefile(self, entry):
+        if entry:
+            if not (entry & (1 << 10)) and not (entry & (1 << 11)):
+                return True
+
+        return False
+
+    def entry_prototype(self, entry):
+        '''
+        Return True if the PTE value is a pointer to a Prototype PTE.
+        #4c0=10011000000
+        That is, the Prototype flag (bit 10) is set
+        and the Transition flag (bit 11) is not.
+        '''
+        if entry:
+            if (entry & (1 << 10)) and not (entry & (1 << 11)):
+                return True
+
+        return False
 
     def entry_present(self, entry):
         if entry:
@@ -95,6 +121,31 @@ class IA32PagedMemory(paged.AbstractWritablePagedMemory):
                 return True
 
         return False
+
+    def entry_subsection(self, pte):
+        subsection_addr = (pte & 0xffffffff00000000) >> 32
+        if subsection_addr == 0:
+            return False
+        subsection = obj.Object("_SUBSECTION", subsection_addr, self)
+        if subsection == None:
+            return False
+        control_area = obj.Object("_CONTROL_AREA", subsection.ControlArea.v(), self)
+        if control_area == None:
+            return False
+        file_object = control_area.FilePointer.dereference_as("_FILE_OBJECT")
+        if file_object == None:
+            return False
+        FileName = str(file_object.FileName)
+        if FileName == '':
+            return False
+        # _MMPTE_SUBSECTION unused null tests
+        if ((pte >> 1) & 0b1111) != 0:
+            #print "unused0 test failed"
+            return False
+        if ((pte >> 11) & 0x1FFFFF) != 0:
+            #print "unused1 test failed"
+            return False
+        return True
 
     def page_size_flag(self, entry):
         if (entry & (1 << 7)) == (1 << 7):
@@ -125,6 +176,69 @@ class IA32PagedMemory(paged.AbstractWritablePagedMemory):
     def get_four_meg_paddr(self, vaddr, pgd_entry):
         return (pgd_entry & ((ptrs_per_pgd - 1) << 22)) | (vaddr & ~((ptrs_per_pgd - 1) << 22))
 
+    def get_prototype(self, vaddr, pte):
+        '''
+        Returns the offset in a 4KB memory page from the given
+        Prototype PTE virtual address.
+        The function returns either None (no valid mapping)
+        or the offset in physical memory where the prototype maps
+
+        See Windows Internals, 6th Edition, Part 2, pages 269-271
+        and http://www.codemachine.com/article_protopte.html.
+        '''
+        if pte is None:
+            return None
+
+        if 0xfffff000 == (0xfffff000 & pte):
+            # Add support for finding prototypes via VAD tree
+            return None
+
+        index_high = (pte & 0xffff800) >> 4
+        index_low = (pte & 0xfe) >> 1
+        prototype_vaddr = 0xe1000000 | (( index_high | index_low ) << 2)
+        prototype_phys = self.vtop(prototype_vaddr)
+        if prototype_phys is None:
+            return None
+
+        prototype_pte = self.read_long_phys(prototype_phys)
+        if not self.entry_present(prototype_pte):
+            return None
+
+        return self.get_paddr(vaddr, prototype_pte)
+
+    def get_pagefile(self, vaddr, pte, proto = False):
+        '''
+        Returns the offset in a 4KB memory page from the given
+        Prototype PTE virtual address.
+        The function returns either None (no valid mapping)
+        or the offset in physical memory where the prototype maps
+
+        See Windows Internals, 6th Edition, Part 2, pages 269-271
+        and http://www.codemachine.com/article_protopte.html.
+        '''
+        if pte is None:
+            return None
+
+        pagefile_num = (pte >> 1) & 0xf
+        pagefile_offset = (pte & 0xfffff000) + (vaddr & 0xfff)
+
+        retAddr = 0
+        if pagefile_offset == 0:
+           # demand Zero
+           if proto:
+                pprofiler.profiling[self.name][pprofiler.DZ_PROTOTYPE] += 1
+           else:
+                pprofiler.profiling[self.name][pprofiler.DEMAND_ZERO] += 1
+           retAddr = (0,0)
+        else:
+            if proto:
+                pprofiler.profiling[self.name][pprofiler.PF_PROTOTYPE] += 1
+            else:
+                pprofiler.profiling[self.name][pprofiler.PAGEFILE] += 1
+            retAddr = (pagefile_offset, "\pagefile.sys")
+
+        return retAddr
+
     def vtop(self, vaddr):
         retVal = None
         pgd = self.get_pgd(vaddr)
@@ -137,6 +251,12 @@ class IA32PagedMemory(paged.AbstractWritablePagedMemory):
                     return None
                 if self.entry_present(pte):
                     retVal = self.get_paddr(vaddr, pte)
+                else:
+                    if self.use_prototype_ptes:
+                        if self.entry_prototype(pte):
+                            retVal = self.get_prototype(vaddr, pte)
+                        if self.entry_pagefile(pte):
+                            retVal = self.get_pagefile(vaddr, pte)
         return retVal
 
     def read_long_phys(self, addr):
@@ -148,6 +268,24 @@ class IA32PagedMemory(paged.AbstractWritablePagedMemory):
             return obj.NoneObject("Unable to read_long_phys at " + hex(addr))
         (longval,) = struct.unpack('<I', string)
         return longval
+
+    def read_long_long_phys(self, addr):
+        '''
+        This method returns a 64-bit little endian
+        unsigned integer from the specified address in the
+        physical address space. If the address cannot be accessed,
+        then the method returns None.
+
+        This code was derived directly from legacyintel.py
+        '''
+        try:
+            string = self.base.read(addr, 8)
+        except IOError:
+            string = None
+        if not string:
+            return obj.NoneObject("Unable to read_long_long_phys at " + hex(addr))
+        (longlongval,) = struct.unpack('<Q', string)
+        return longlongval
 
     def get_available_pages(self):
         pgd_curr = self.dtb
@@ -186,6 +324,8 @@ class IA32PagedMemoryPae(IA32PagedMemory):
        "Windows Internals, 5th Edition", Microsoft Press, 2009.
     """
 
+    last_pte_vad = None
+    last_vaddr = None
     order = 60
     pae = True
 
@@ -228,23 +368,226 @@ class IA32PagedMemoryPae(IA32PagedMemory):
     def get_large_paddr(self, vaddr, pgd_entry):
         return (pgd_entry & 0xFFFFFFFE00000) | (vaddr & ~((ptrs_page - 1) << 21))
 
-    def vtop(self, vaddr):
-        retVal = None
-        pdpe = self.get_pdpi(vaddr)
+    def find_pte_vad(self, vaddr):
+        vaddrPageBase = vaddr & 0xFFFFF000
 
+        # if we aquired a vadroot
+        try:
+            self.vadlookup
+        except AttributeError:
+            return None
+
+        # If we need the last PTE again, load it from cache
+        if vaddrPageBase != self.last_vaddr:
+            # Find the vad that contains our address
+            try:
+                self.last_pte_vad = self.vadlookup[vaddr]
+            except KeyError:
+                return None
+            # if succeed save it to cache
+            self.last_vaddr = vaddrPageBase
+
+        #if self.last_pte_vad == None:
+        #    return None
+
+        pageNum = (vaddrPageBase - self.last_pte_vad.Start) / 0x1000
+        prototype_vaddr =  self.last_pte_vad.FirstPrototypePte.v() + (pageNum*8)
+        return (prototype_vaddr, self.last_pte_vad, pageNum)
+
+    def get_zeropte(self, vaddr):
+        '''
+        Kikeressuk a PTE-t a VAD-okat leiro PTE-k kozul
+        '''
+        pte_vad = self.find_pte_vad(vaddr)
+        if pte_vad == None:
+            return 0
+        # unpack the return value
+        (prototype_vaddr, currentVad, pageNum) = pte_vad
+
+        # read the pte from physical memory
+        prototype_phys = self.vtop(prototype_vaddr)
+        if prototype_phys == None:
+            return 0
+        return self.read_long_long_phys(prototype_phys)
+
+    def get_subsection(self, vaddr, pte):
+        subsection_addr = (pte & 0xffffffff00000000) >> 32
+        subsection = obj.Object("_SUBSECTION", subsection_addr, self)
+        if subsection == None:
+            pprofiler.profiling[self.name][pprofiler.MAPPED_FILE_UNKNOWN] += 1
+            return None
+        control_area = obj.Object("_CONTROL_AREA", subsection.ControlArea.v(), self)
+        file_object = control_area.FilePointer.dereference_as("_FILE_OBJECT") # TODO zero check
+        FileName = str(file_object.FileName)
+
+        pte_vad = self.find_pte_vad(vaddr)
+        if pte_vad == None:
+            return None
+        (pte_addr, currentVad, pageNum) = pte_vad
+
+        StartingSector = subsection.StartingSector
+        SubsectionOffset = StartingSector * 0x200
+        ptrNum = (pte_addr - subsection.SubsectionBase) / 8
+
+        FileOffset = SubsectionOffset + (ptrNum * 0x1000) + (vaddr & ((1 << page_shift) - 1))
+        pprofiler.file_objects[self.name].add(FileName)
+        return (FileOffset, FileName)
+
+    def get_prototype(self, vaddr, pte):
+        '''
+        Returns the offset in a 4KB memory page from the given
+        Prototype PTE virtual address.
+        The function returns either None (no valid mapping)
+        or the offset in physical memory where the prototype maps
+
+        See Windows Internals, 6th Edition, Part 2, pages 269-271
+        and http://www.codemachine.com/article_protopte.html.
+        '''
+        if pte is None:
+            return None
+
+        if 0xffffffff00000000 == (0xfffffffffffff000 & pte):
+            pte_vad = self.find_pte_vad(vaddr)
+            if pte_vad == None:
+                return None
+            # unpack the return value
+            (prototype_vaddr, currentVad, pageNum) = pte_vad
+        else:
+            currentVad = None
+            prototype_vaddr = (pte & 0xffffffff00000000) >> 32
+
+        # read the prototype pte from physical memory
+        prototype_phys = self.vtop_proto(prototype_vaddr)
+        if prototype_phys is None:
+            pprofiler.profiling[self.name][pprofiler.PROTO_INVALID] += 1
+            debug.debug("Invalid Proto PTE: " + hex(vaddr) + " type: " + hex(pte))
+            return None
+
+        prototype_pte = self.read_long_long_phys(prototype_phys)
+
+        retVal = None
+        # check if this prototype entry is in memory
+        if self.entry_present(prototype_pte):
+            pprofiler.profiling[self.name][pprofiler.PROTO_VALID] += 1
+            retVal = self.get_paddr(vaddr, prototype_pte)
+        elif self.entry_pagefile(prototype_pte):
+            return self.get_pagefile(vaddr, prototype_pte, True)
+        elif self.entry_prototype(prototype_pte):
+            if self.entry_subsection(prototype_pte):
+                pprofiler.profiling[self.name][pprofiler.MAPPED_FILE_PROTO] += 1
+                return self.get_subsection(vaddr, prototype_pte)
+            else:
+                pprofiler.profiling[self.name][pprofiler.PROTO_UNKNOWN] += 1
+                debug.debug("Unknown prototype PTE: " + hex(vaddr) + " type: " + str(prototype_pte))
+        else:
+            #retVal = self.get_zeropte(vaddr)
+            #prototype_pte: 128 demand zero
+            pprofiler.profiling[self.name][pprofiler.PROTO_UNKNOWN] += 1
+            debug.debug("Unknown prototype PTE: " + hex(vaddr) + " type: " + str(prototype_pte))
+        return retVal
+
+    def vtop_proto(self, proto_vaddr):
+        '''
+        Feltetelezem hogy maga a hivatkozott Prototype PTE, nem lehet LARGE, illetve EMPTY PTE-ken tarolva
+        '''
+        retVal = None
+        pdpe = self.get_pdpi(proto_vaddr)
         if not self.entry_present(pdpe):
             return retVal
-
-        pgd = self.get_pgd(vaddr, pdpe)
+        pgd = self.get_pgd(proto_vaddr, pdpe)
         if self.entry_present(pgd):
-            if self.page_size_flag(pgd):
-                retVal = self.get_large_paddr(vaddr, pgd)
-            else:
-                pte = self.get_pte(vaddr, pgd)
+            if not self.page_size_flag(pgd):
+                pte = self.get_pte(proto_vaddr, pgd)
                 if self.entry_present(pte):
-                    retVal = self.get_paddr(vaddr, pte)
+                    retVal = self.get_paddr(proto_vaddr, pte)
 
         return retVal
+
+    def profile_pte_flags(self, pxx):
+        writeable = (pxx & 0b10) == 0b10
+        kernel_mode = (pxx & 0b100) == 0
+        cache_writeback = (pxx & 0b1000) == 0
+        cache = (pxx & 0b10000) == 0
+        accessed = (pxx & 0b100000) == 0b100000
+        dirty = (pxx & 0b1000000) == 0b1000000
+        copyonwrite = (pxx & 0b1000000000) == 0b1000000000
+        nx = (pxx & (1 << 63)) != 0
+
+        if nx:
+            pprofiler.profiling[self.name][pprofiler.NX] += 1
+        if writeable:
+            pprofiler.profiling[self.name][pprofiler.WRITEABLE] += 1
+        if kernel_mode:
+                pprofiler.profiling[self.name][pprofiler.KERNEL_MODE] += 1
+        if cache_writeback:
+            pprofiler.profiling[self.name][pprofiler.CACHE_WRITEBACK] += 1
+        if cache:
+            pprofiler.profiling[self.name][pprofiler.CACHE] += 1
+        if accessed:
+            pprofiler.profiling[self.name][pprofiler.ACCESSED] += 1
+        if dirty:
+            pprofiler.profiling[self.name][pprofiler.DIRTY] += 1
+        if copyonwrite:
+            pprofiler.profiling[self.name][pprofiler.COPYONWRITE] += 1
+
+    def process_entry(self, vaddr, pgd, pte):
+        retVal = None
+        if (pgd & 0b100000000) == 0b100000000:
+            pprofiler.profiling[self.name][pprofiler.GLOBAL_PDE] += 1
+        # If large page flag is set in PGD
+        if self.page_size_flag(pgd):
+            pprofiler.profiling[self.name][pprofiler.LARGE] += 1
+            retVal = self.get_large_paddr(vaddr, pgd)
+        else:
+            # if PTE still zero, return none
+            if pte == 0:
+                pprofiler.profiling[self.name][pprofiler.EMPTY_PTE] += 1
+                #Reserved, but not committed page
+                return (0,0)
+            self.profile_pte_flags(pte)
+            if self.entry_present(pte):
+                pprofiler.profiling[self.name][pprofiler.VALID] += 1
+                retVal = self.get_paddr(vaddr, pte)
+            # if valid PTE, resolve type
+            elif self.entry_prototype(pte):
+                if self.entry_subsection(pte):
+                    pprofiler.profiling[self.name][pprofiler.MAPPED_FILE] += 1
+                    retVal = self.get_subsection(vaddr, pte)
+                else:
+                    retVal = self.get_prototype(vaddr, pte)
+            elif self.entry_pagefile(pte):
+                #pprofiler.profiling[self.name][pprofiler.PAGEFILE] += 1
+                retVal = self.get_pagefile(vaddr, pte)
+            else:
+                pprofiler.profiling[self.name][pprofiler.UNKNOWN] += 1
+                if vaddr != 0:
+                    debug.debug("Unknown PTE: " + hex(vaddr))
+        return retVal
+
+    def vtop(self, vaddr):
+        # if we have an invalid address 0?
+        if vaddr == 0:
+            return None
+        # try to search in PDP table
+        pdpe = self.get_pdpi(vaddr)
+        if not self.entry_present(pdpe):
+            pprofiler.profiling[self.name][pprofiler.EMPTY_PDPE] += 1
+            return (0,0)
+        # find the PGD in PDP
+        pgd = self.get_pgd(vaddr, pdpe)
+        pte = 0
+        # If invalid PGD present for a valid address, search the representing PTE in VAD
+        if (not self.entry_present(pgd)) or pgd == 0:
+            pte = self.get_zeropte(vaddr)
+        # IF we had a valid PGD, get the corresponding PTE
+        else:
+            # first try to get the entry as usual
+            pte = self.get_pte(vaddr, pgd)
+            # if PTE still zero, try to find it in VAD
+            if pte == 0:
+                pte = self.get_zeropte(vaddr)
+
+        return self.process_entry(vaddr, pgd, pte)
 
     def _read_long_long_phys(self, addr):
         if not addr:

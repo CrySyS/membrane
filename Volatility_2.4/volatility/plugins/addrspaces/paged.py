@@ -49,8 +49,6 @@ class AbstractPagedMemory(addrspace.AbstractVirtualAddressSpace):
             else:
                 self.as_assert(False, "Profile does not have valid Address Space check")
 
-        # Reserved for future use
-        #self.pagefile = config.PAGEFILE
         self.name = 'Kernel AS'
 
     def load_dtb(self):

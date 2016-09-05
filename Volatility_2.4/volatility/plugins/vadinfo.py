@@ -361,7 +361,7 @@ class VADDump(VADInfo):
 
                 path = os.path.join(
                     self._config.DUMP_DIR, "{0}.{1:x}.{2}-{3}.dmp".format(
-                    task.ImageFileName, offset, vad_start, vad_end))
+                    task.ImageFileName, offset, vad_start, hex(vad.End - vad.Start + 1)))
 
                 if (task.IsWow64 and vad.CommitCharge == max_commit and 
                         vad.End > 0x7fffffff):

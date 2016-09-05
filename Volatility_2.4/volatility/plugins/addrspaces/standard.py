@@ -29,6 +29,9 @@ import volatility.addrspace as addrspace
 import volatility.debug as debug #pylint: disable-msg=W0611
 import urllib
 import os
+import sys
+import traceback
+import collections
 
 #pylint: disable-msg=C0111
 
@@ -144,3 +147,94 @@ class FileAddressSpace(addrspace.BaseAddressSpace):
     def __eq__(self, other):
         return self.__class__ == other.__class__ and self.base == other.base and hasattr(other, "fname") and self.fname == other.fname
 
+class DynamicFileAddressSpace(FileAddressSpace):
+    # We should try to instantiate it before normal file address space
+    order = 99
+    used_files = collections.defaultdict(lambda: collections.defaultdict(str))
+    currentPath = ''
+
+    def __init__(self, base, config, layered = False, **kwargs):
+        FileAddressSpace.__init__(self, base, config, layered, **kwargs)
+        self.as_assert(('mountdrive' in config.opts), "No mounted drive found")
+        self.mntdrive = config.MOUNTDRIVE
+
+    def convert_path(self, path):
+        separator = os.path.sep
+        if separator != '\\':
+            path = path.replace('\\', separator)
+        return path
+
+    def reload_file(self, path):
+        def assign_used_file():
+            self.currentPath = path
+            self.fname = self.used_files[path]['fname']
+            self.name = self.used_files[path]['fname']
+            self.mode = self.used_files[path]['mode']
+            self.fhandle = self.used_files[path]['fhandle']
+            self.fhandle.seek(0, 2)
+            self.fsize = self.used_files[path]['fsize']
+
+        if path in self.used_files:
+            if self.currentPath == path:
+                return
+            assign_used_file()
+        else:
+            debug.debug('read from file: ' + path)
+            path_name = urllib.url2pathname(path)
+            if not os.path.exists(path_name):
+                debug.warning('File not exist: ' + path + ' Returning zero bytes..')
+                currentPath = 'ZERO'
+                return
+            # assert os.path.exists(path_name), 'Filename must be specified and exist'
+            self.used_files[path]['fname'] = os.path.abspath(path_name)
+            self.used_files[path]['mode'] = 'rb'
+            if self._config.WRITE:
+                self.used_files[path]['mode'] += '+'
+            self.used_files[path]['fhandle'] = open(self.used_files[path]['fname'], self.used_files[path]['mode'])
+            self.used_files[path]['fsize'] = self.fhandle.tell()
+            assign_used_file()
+
+
+    def is_valid_address(self, addr):
+        if addr == None:
+            return False
+        if isinstance(addr, tuple):
+            # Demand zero lapok mindig validok
+            if addr == (0,0):
+                return True
+            else:
+                filepath = self.convert_path(str(addr[1]))
+                offset = addr[0]
+                self.reload_file(self.mntdrive + filepath)
+        return 0 <= addr < self.fsize
+
+    def read(self, addr, length):
+        if isinstance(addr, tuple):
+            # Ures teruletet adhatunk vissza ilyenkor
+            if addr == (0,0):
+                data = "\x00" * length
+                return data
+            # Decompose tuple
+            filepath = self.convert_path(str(addr[1]))
+            addr = int(addr[0])
+            self.reload_file(self.mntdrive + filepath)
+        else:
+            self.reload_file(self._config.LOCATION[7:])
+            addr = int(addr)
+
+        if self.currentPath == 'ZERO':
+            data = "\x00" * length
+            return data
+
+        length = int(length)
+        self.fhandle.seek(addr)
+        data = self.fhandle.read(length)
+        if len(data) == 0:
+            return None
+
+        # Pad the data from file to page size
+        if isinstance(addr, tuple):
+            if len(data) < length:
+                data += (length - len(data)) * "\x00"
+
+        return data

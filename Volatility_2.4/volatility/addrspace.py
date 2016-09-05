@@ -81,6 +81,8 @@ class BaseAddressSpace(object):
 
         config.add_option("LOCATION", default = None, short_option = 'l',
                           help = "A URN location from which to load an address space")
+        config.add_option("MOUNTDRIVE", default = None, type = 'str',
+                          nargs = 1, help = "Drive letter of the mounted image")
 
     def get_config(self):
         """Returns the config object used by the vm for use in other vms"""
@@ -227,6 +229,10 @@ class AbstractDiscreteAllocMemory(BaseAddressSpace):
            If pad is True, any read errors result in "\x00" bytes filling the missing read locations
         """
 
+        # If its a tuple, pass the read to the base
+        if isinstance(addr, tuple):
+            return self.base.read(addr, length)
+
         if not self.alignment_gcd or not self.minimum_size:
             self.calculate_alloc_stats()
 
@@ -333,7 +339,11 @@ class AbstractRunBasedMemory(AbstractDiscreteAllocMemory):
 
         @param phys_addr: a physical address
         """
-        return self.translate(phys_addr) is not None
+        # Support for DynamicFileAddressSpace base (paged memory)
+        if isinstance(phys_addr, tuple):
+            self.base.is_valid_address(phys_addr)
+        else:
+            return self.translate(phys_addr) is not None
 
     def get_address_range(self):
         """ This relates to the logical address range that is indexable """

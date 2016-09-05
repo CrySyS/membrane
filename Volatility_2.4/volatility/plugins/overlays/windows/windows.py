@@ -374,6 +374,39 @@ class DosDate(obj.NativeType):
         #return time.mktime(datetime.datetime(year, month, day, hours, minutes, seconds).timetuple())
 
 
+class VadDict(dict):
+    def __init__(self, d = {}):
+        for k,v in d.items():
+            self[k] = v
+
+    def __getitem__(self, key):
+        for k, v in self.items():
+            if k[0] <= key < k[1]:
+                return v
+        raise KeyError("Key '%s' is not between any values in the BetweenDict" % key)
+
+    def __setitem__(self, key, value):
+        try:
+            if len(key) == 2:
+                if key[0] < key[1]:
+                    dict.__setitem__(self, (key[0], key[1]), value)
+                else:
+                    raise RuntimeError('First element of a BetweenDict key '
+                                       'must be strictly less than the '
+                                       'second element')
+            else:
+                raise ValueError('Key of a BetweenDict must be an iterable '
+                                 'with length two')
+        except TypeError:
+            raise TypeError('Key of a BetweenDict must be an iterable '
+                             'with length two')
+
+    def __contains__(self, key):
+        try:
+            return bool(self[key]) or True
+        except KeyError:
+            return False
+
 class _EPROCESS(obj.CType, ExecutiveObjectMixin):
     """ An extensive _EPROCESS with bells and whistles """
     @property
@@ -395,6 +428,20 @@ class _EPROCESS(obj.CType, ExecutiveObjectMixin):
 
         return obj.NoneObject("Peb not found")
 
+    def load_vadlookup(self, vadroot):
+        vadlookup = VadDict()
+
+        for vad in vadroot.traverse():
+            # Valid magic check
+            if not vad.is_valid():
+                continue
+            # Mapped file check
+            if not (vad.u.VadFlags.PrivateMemory == 0 and vad.ControlArea):
+                continue
+            if vad.Start not in vadlookup:
+                vadlookup[(vad.Start, vad.End)] = vad
+        return vadlookup
+
     def get_process_address_space(self):
         """ Gets a process address space for a task given in _EPROCESS """
         directory_table_base = self.Pcb.DirectoryTableBase.v()
@@ -404,7 +451,8 @@ class _EPROCESS(obj.CType, ExecutiveObjectMixin):
         except AssertionError, _e:
             return obj.NoneObject("Unable to get process AS")
 
-        process_as.name = "Process {0}".format(self.UniqueProcessId)
+        process_as.name = "Process {0} - {1}".format(self.UniqueProcessId, self.ImageFileName)
+        process_as.vadlookup = self.load_vadlookup(self.VadRoot)
 
         return process_as
 
