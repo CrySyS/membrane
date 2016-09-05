@@ -10,12 +10,15 @@ success in most cases, including advanced targeted attacks. Our method
 is generic enough and hence could significantly raise the bar for attackers
 to remain stealthy and persist for an extended period of time.
 
+**Corresponding article:**
+
+G. Pék, Zs. Lázár, Z. Várnagy, M. Félegyházi, L. Buttyán, [Membrane: A Posteriori Detection of Malicious Code Loading by Memory Paging Analysis (Accepted paper),](http://www.crysys.hu/~pek/pubs/Pek+16ESORICS.pdf), ESORICS, Heraklion, Greece, 2016. 
+
+
 ## Source
 
 This repository contains the memory traversal part of the Membrane source code. Please find the traditional Volatility extension in the `membrane` directory.
 As snapshot creation can be a heavy-duty operation, we further designed and implemented a live monitoring version of Membrane called
 Membrane Live by extending a virtual machine introspection-based malware analysis tool called [DRAKVUF](https://github.com/tklengyel/drakvuf).
-
-
 
 
