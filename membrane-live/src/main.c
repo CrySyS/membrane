@@ -116,6 +116,7 @@
 #include "xen_helper.h"
 #include "win-symbols.h"
 #include "xmlrpc_client.h"
+#include "pages.h"
 
 #define CLONE "../tools/clone.pl"
 
@@ -146,10 +147,27 @@ static void memshare(honeymon_clone_t *clone) {
     if (clone->origin->domID == INVALID_DOMID)
         return;
 
-    printf("Shared %lu pages\n",
-           xen_memshare(clone->honeymon->xen,
-                        clone->origin->domID,
-                        clone->domID));
+    uint64_t page = xc_domain_maximum_gpfn(clone->honeymon->xen->xc,
+            clone->domID);
+
+    if (page == 0) {
+        printf("Failed to get max gpfn!\n");
+        return;
+    }
+
+    uint64_t shared = 0;
+    for (; page > 0; page--) {
+        if (!g_hash_table_lookup(clone->page_lookup, &page)) {
+            if (xen_memshare(clone->honeymon->xen, clone->origin->domID,
+                    clone->domID, page)) {
+                shared++;
+            }
+        } else {
+            printf("Skipping page %lu from memory sharing\n", page);
+        }
+    }
+
+    printf("Shared %lu pages\n", shared);
 }
 
 static int init_origin(honeymon_honeypot_t *origin) {
@@ -194,6 +212,7 @@ int main(int argc, char** argv) {
 
     _clone.honeymon = &_honeymon;
     _clone.origin = &_origin;
+    _clone.vlan = atoi(argv[3]);
 
     xen_init_interface(&_honeymon.xen);
 
@@ -209,7 +228,6 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        _clone.vlan = atoi(argv[4]);
         make_clone(_honeymon.xen, _origin.name, &_clone.domID, _clone.vlan, &_clone.clone_name);
 
         memshare(&_clone);
@@ -224,13 +242,24 @@ int main(int argc, char** argv) {
     if (!strcmp(argv[1], "-d")) {
         _origin.domID = INVALID_DOMID;
         get_dom_info(_honeymon.xen, argv[3], &_clone.domID, &_clone.clone_name);
-    }
 
+        if(argc == 5) {
+            fd_profiler = init_profiler(argv[4]);
+        }
+        else {
+            fd_profiler = init_profiler("-1");
+        }
+        if(!fd_profiler) {
+            goto exit;
+        }
+        else {
+            printf("Profiler initialized.");
+        }
+    }
     _origin.rekall_profile = argv[2];
     if (init_origin(&_origin) == 1) {
         goto exit;
     }
-
     clone_vmi_init(&_clone);
 
     if (!_clone.vmi) {
@@ -272,6 +301,7 @@ int main(int argc, char** argv) {
     close_vmi_clone(&_clone);
 
 exit:
+    fclose(fd_profiler);
     free_origin(&_origin);
     xen_free_interface(_honeymon.xen);
     g_tree_destroy(_honeymon.pooltags);

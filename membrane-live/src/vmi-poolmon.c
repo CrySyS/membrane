@@ -123,8 +123,6 @@
 #include "vmi-poolmon.h"
 #include "file_extractor.h"
 
-#define POOLTAG_FILE "Fil\xe5"
-
 /*
  NTKERNELAPI
  NTSTATUS
@@ -154,7 +152,7 @@ void objcreate(vmi_instance_t vmi, vmi_event_t *event, reg_t cr3) {
 
     vmi_read_8(vmi, &ctx, &index);
 
-    if (index < WIN7_TYPEINDEX_LAST) {
+    if (index <= WIN7_TYPEINDEX_LAST) {
         printf("\tObject: %s\n", win7_typeindex[index]);
     } else {
         printf("\tUnknown object type index: %u\n", index);
@@ -213,8 +211,8 @@ void pool_tracker(vmi_instance_t vmi, vmi_event_t *event, reg_t cr3,
                 ctag, ctag[0], ctag[1], ctag[2], ctag[3]);
     }
 
-    // Only trap the return of File allocations for now
-    if (strncmp(ctag, POOLTAG_FILE, 4))
+    /* Only trap the return of Files (3815731792) and Processes (3849087302) */
+    if ((uint32_t)tag != 3815731792 && (uint32_t)tag != 3849087302)
         return;
 
     uint8_t backup = 0;
@@ -373,16 +371,17 @@ void pool_alloc_return(vmi_instance_t vmi, vmi_event_t *event, addr_t pa,
                 block_size = ph.block_size * 0x10; // align it
             }
 
+            char *t = (char*) &tag;
             if ((uint32_t)tag != pool->tag) {
                 printf(
                         "%s --!! Pool tag mangling detected: got '%c%c%c%c', expected '%c%c%c%c' !!--\n",
-                        ts, ((char *)&tag)[0], ((char *)&tag)[1], ((char *)&tag)[2], ((char *)&tag)[3],
-                        pool->ctag[0], pool->ctag[1], pool->ctag[2], pool->ctag[3]);
+                        ts, t[0], t[1], t[2], t[3], pool->ctag[0],
+                        pool->ctag[1], pool->ctag[2], pool->ctag[3]);
             } else {
                 printf("\t'%c%c%c%c' heap allocation verified @ PA 0x%lx. Size: %u\n",
-                        pool->ctag[0], pool->ctag[1], pool->ctag[2], pool->ctag[3], obj_pa, block_size);
-
-                if (!strncmp(pool->ctag, POOLTAG_FILE, 4)) {
+                        t[0], t[1], t[2], t[3], obj_pa, block_size);
+                /* "Fil\xe5" = 3849087302; */
+                if ((uint32_t)tag == 3849087302) {
                     setup_file_watch(clone, vmi, rax, ph_base, block_size);
                 }
             }

@@ -125,6 +125,7 @@
 #include "file_extractor.h"
 #include "xen_helper.h"
 #include "rdtsc.h"
+#include "pages.h"
 
 static uint64_t read_count, write_count, x_count;
 
@@ -237,9 +238,9 @@ void trap_guard(vmi_instance_t vmi, vmi_event_t *event) {
         addr_t *key = NULL;
         struct memevent *s = NULL;
         ghashtable_foreach(containers, i, key, s) {
-            /*printf("Write memaccess @ 0x%lx. Page %lu. Symbol: %s!%s\n", pa,
+            printf("Write memaccess @ 0x%lx. Page %lu. Symbol: %s!%s\n", pa,
                     event->mem_event.gfn, s->symbol.config->name,
-                    s->symbol.symbol->name);*/
+                    s->symbol.symbol->name);
             if (s && s->sID == SYMBOLWRAP) {
                 if (pa > s->pa - 7 && pa <= s->pa) {
                     printf("** Mem event removing trap 0x%lx -> %s!%s\n", s->pa,
@@ -259,6 +260,51 @@ void trap_guard(vmi_instance_t vmi, vmi_event_t *event) {
     }
 
     //vmi_set_vcpureg(vmi, tsc+(rdtsc()-deltatsc), TSC, event->vcpu_id);
+}
+
+char * get_proc_name(vmi_instance_t vmi, pid_t current_pid) {
+    char *procname = "Invalid";
+    addr_t current_process = 0, next_list_entry = 0;
+    vmi_read_addr_ksym(vmi, "PsInitialSystemProcess", &current_process);
+
+    addr_t list_head = current_process + offsets[EPROCESS_TASKS];
+    addr_t current_list_entry = list_head;
+
+    status_t status = vmi_read_addr_va(vmi, current_list_entry, 0,
+            &next_list_entry);
+    if (status == VMI_FAILURE) {
+        printf(
+                "Failed to read next pointer at 0x%"PRIx64" before entering loop\n",
+                current_list_entry);
+        goto exit;
+    }
+    do {
+        vmi_pid_t pid;
+        vmi_read_32_va(vmi, current_process + offsets[EPROCESS_PID], 0, &pid);
+
+        if (pid == current_pid) {
+            procname = vmi_read_str_va(vmi, current_process + offsets[EPROCESS_PNAME], 0);
+            if (!procname) {
+                goto exit;
+            }
+        }
+        
+        current_list_entry = next_list_entry;
+        current_process = current_list_entry - offsets[EPROCESS_TASKS];
+
+        /* follow the next pointer */
+
+        status = vmi_read_addr_va(vmi, current_list_entry, 0, &next_list_entry);
+        if (status == VMI_FAILURE) {
+            printf("Failed to read next pointer in loop at %"PRIx64"\n",
+                    current_list_entry);
+            goto exit;
+        }
+        
+    } while (next_list_entry != list_head);
+  
+exit:
+    return procname;
 }
 
 void int3_cb(vmi_instance_t vmi, vmi_event_t *event) {
@@ -292,6 +338,37 @@ void int3_cb(vmi_instance_t vmi, vmi_event_t *event) {
         //if (!strcmp(s->config->name, "ntkrnlmp")
         //        || !strcmp(s->config->name, "ntkrpamp")) {
 
+        //if (!strcmp(s->symbol->name, "NtCreateProcess")
+        //        || !strcmp(s->symbol->name, "NtCreateProcessEx")) {
+        if(!strstr(s->symbol->name, "ExAllocatePool")) {
+        access_context_t ctx = {
+            .translate_mechanism = VMI_TM_PROCESS_DTB,
+            .dtb = cr3
+        };
+
+        reg_t rsp;
+        vmi_get_vcpureg(vmi, &rsp, RSP, event->vcpu_id);
+
+        FnParams fn_data;
+        if (PM2BIT(clone->pm) == BIT32) {
+            ctx.addr = rsp+12;
+            vmi_read_32(vmi, &ctx, (uint32_t*)&fn_data.param3);
+            ctx.addr = rsp+8;
+            vmi_read_32(vmi, &ctx, (uint32_t*)&fn_data.param2);
+            ctx.addr = rsp+4;
+            vmi_read_32(vmi, &ctx, (uint32_t*)&fn_data.param1);
+        } else {
+            vmi_get_vcpureg(vmi, &fn_data.param1, RCX, event->vcpu_id);
+            vmi_get_vcpureg(vmi, &fn_data.param2, RDX, event->vcpu_id);
+            vmi_get_vcpureg(vmi, &fn_data.param3, R8, event->vcpu_id);
+        }
+        fn_data.fn_name = s->symbol->name;
+
+        if(trigger_profiler != 0) {
+            get_pages(vmi, cr3, &fn_data);
+        }
+        //}
+}
         if (!strncmp(s->symbol->name, "ObCreateObject", 14)) {
             objcreate(vmi, event, cr3);
         }
@@ -539,13 +616,11 @@ void inject_traps(honeymon_clone_t *clone) {
                 current_list_entry);
         return;
     }
-
+    FILE * fd1 = fopen("/root/profiler/pid_name_list.txt", "w");
     do {
 
         vmi_pid_t pid;
-        uint32_t dtb;
-        vmi_read_32_va(vmi, current_process + offsets[EPROCESS_PID], 0, (uint32_t*)&pid);
-        vmi_read_32_va(vmi, current_process + offsets[EPROCESS_PDBASE], 0, &dtb);
+        vmi_read_32_va(vmi, current_process + offsets[EPROCESS_PID], 0, &pid);
 
         char *procname = vmi_read_str_va(vmi, current_process + offsets[EPROCESS_PNAME], 0);
 
@@ -553,7 +628,8 @@ void inject_traps(honeymon_clone_t *clone) {
             goto exit;
         }
 
-        printf("Found process: [PID: %5d, CR3: 0x%lx] %s\n", pid, dtb, procname);
+        printf("Found process: [%5d] %s\n", pid, procname);
+        fprintf(fd1, "Found process: [%5d] %s\n", pid, procname);
         free(procname);
 
         addr_t imagebase = 0, peb = 0, ldr = 0, modlist = 0;
@@ -585,6 +661,7 @@ void inject_traps(honeymon_clone_t *clone) {
     } while (next_list_entry != list_head);
 
 exit:
+    fclose(fd1);
     return;
 }
 
@@ -657,6 +734,8 @@ void clone_vmi_init(honeymon_clone_t *clone) {
     clone->pm = vmi_get_page_mode(clone->vmi);
 
     // Crete tables to lokup symbols from
+    clone->page_lookup = g_hash_table_new_full(g_int64_hash, g_int64_equal,
+            free, NULL);
     clone->pa_lookup = g_hash_table_new_full(g_int64_hash, g_int64_equal, free,
             NULL);
 
@@ -760,6 +839,7 @@ void close_vmi_clone(honeymon_clone_t *clone) {
     } while (0);
 
     g_hash_table_destroy(clone->pool_lookup);
+    g_hash_table_destroy(clone->page_lookup);
     g_hash_table_destroy(clone->file_watch);
     g_hash_table_destroy(clone->files_accessed);
 

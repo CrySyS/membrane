@@ -120,7 +120,6 @@
 
 #include <glib.h>
 #include <libvmi/libvmi.h>
-#include <libvmi/events.h>
 
 #ifdef HAVE_XMLRPC
 #include <xmlrpc-c/base.h>
@@ -310,6 +309,7 @@ typedef struct clone {
   vmi_instance_t vmi;
   win_ver_t winver;
   GTree *guid_lookup; // key: both PE and PDB GUIDs
+  GHashTable *page_lookup; // key: page #
   GHashTable *pa_lookup; // key: PA of trap
   GHashTable *pool_lookup; // key: PA of trap
   GHashTable *file_watch;

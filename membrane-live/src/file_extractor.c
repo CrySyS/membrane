@@ -114,8 +114,9 @@
 #include "structures.h"
 #include "vmi.h"
 #include "win-handles.h"
+#include "pages.h"
 
-#define VOL_DUMPFILES "%s %s -l vmi://domid/%u --profile=%s -Q 0x%lx -D /tmp -n dumpfiles 2>&1"
+#define VOL_DUMPFILES "%s %s -l vmi://domid/%u --profile=%s -Q %lu -D /tmp -n dumpfiles 2>&1"
 #define PROFILE32 "Win7SP1x86"
 #define PROFILE64 "Win7SP1x64"
 
@@ -199,18 +200,16 @@ void grab_file_by_handle(honeymon_clone_t *clone, vmi_event_t *event, reg_t cr3,
         .addr = obj + offsets[OBJECT_HEADER_TYPEINDEX],
         .dtb = cr3
     };
-    if (VMI_FAILURE == vmi_read_8(vmi, &ctx, &type_index))
+    vmi_read_8(vmi, &ctx, &type_index);
+
+    //printf("Handle: 0x%lx. Obj @ 0x%lx. Type: %s\n", handle, obj, win7_typeindex[obj_hdr.type_index]);
+
+    if (type_index != 28)
         return;
 
-    //printf("Handle: 0x%lx. Obj @ 0x%lx. Type: %s\n", handle, obj, win7_typeindex[type_index]);
-
-    if (type_index >= WIN7_TYPEINDEX_LAST || type_index != 28)
-        return;
-
-    addr_t file = obj + offsets[OBJECT_HEADER_BODY];
-    addr_t file_pa = vmi_pagetable_lookup(vmi, cr3, file);
+    addr_t file = obj + struct_sizes[OBJECT_HEADER];
     addr_t filename = file + offsets[FILE_OBJECT_FILENAME];
-    //printf("Object header is @ 0x%lx. File Object is @ 0x%lx.\n", obj, file);
+    printf("Object header is @ 0x%lx. File Object is @ 0x%lx.\n", obj, file);
 
     uint16_t length = 0;
     addr_t buffer = 0;
@@ -232,11 +231,11 @@ void grab_file_by_handle(honeymon_clone_t *clone, vmi_event_t *event, reg_t cr3,
         vmi_read(vmi, &ctx, str.contents, length);
 
         unicode_string_t str2 = { .contents = NULL };
-        status_t rc = vmi_convert_str_encoding(&str, &str2, "UTF-8");
-        if (rc == VMI_SUCCESS) {
+        vmi_convert_str_encoding(&str, &str2, "UTF-8");
+        if (str2.contents) {
             printf("\tExtracting file: %s\n", str2.contents);
 
-            volatility_extract_file(clone, file_pa);
+            volatility_extract_file(clone, file);
 
             free(str2.contents);
         }
@@ -257,8 +256,8 @@ void grab_file_before_delete(vmi_instance_t vmi, vmi_event_t *event, reg_t cr3,
     if (!strcmp(s->symbol->name, "NtSetInformationFile")
             || !strcmp(s->symbol->name, "ZwSetInformationFile")) {
 
-        uint32_t fileinfoclass = 0;
-        reg_t handle = 0, info = 0, length = 0, rsp = 0;
+        uint32_t fileinfoclass;
+        reg_t handle, info, length, rsp;
         vmi_get_vcpureg(vmi, &rsp, RSP, event->vcpu_id); // stack pointer
 
         if (PM2BIT(clone->pm) == BIT32) {
@@ -284,7 +283,7 @@ void grab_file_before_delete(vmi_instance_t vmi, vmi_event_t *event, reg_t cr3,
             ctx.addr = info;
             vmi_read_8(vmi, &ctx, &del);
             if (del) {
-                //printf("DELETE FILE _FILE_OBJECT Handle: 0x%lx.\n", handle);
+                printf("DELETE FILE _FILE_OBJECT Handle: 0x%lx.\n", handle);
                 grab_file_by_handle(clone, event, cr3, handle);
             }
         }
@@ -321,7 +320,9 @@ void file_name_post_cb(vmi_instance_t vmi, vmi_event_t *event) {
 
             reg_t cr3;
             vmi_get_vcpureg(vmi, &cr3, CR3, event->vcpu_id);
-
+            if(strstr(str2.contents, "test.exe")) {
+                trigger_profiler = 1;
+            }
             printf("CR3 0x%lx File accessed: %s.\n File object @ 0x%lx. File base @ 0x%lx.\n",
                     cr3, str2.contents, watch->obj, watch->file_base);
 
